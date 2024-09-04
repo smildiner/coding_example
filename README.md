@@ -16,4 +16,4 @@ To reproduce the results of the study, follow these steps:
 
 ## Contact
 
-For any further questions, please contact <s.mildinermoraga@uu.nl> or .
+For any further questions, please contact <s.mildinermoraga@uu.nl> or <smildiner@gmail.com>.
