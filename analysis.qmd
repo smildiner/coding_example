@@ -1,0 +1,902 @@
+---
+title: "Code example: uncovering neural states from electrophysiological recordings"
+author: "Sebastian Mildiner Moraga"
+editor: source
+format: 
+  html:
+    toc: true
+    self-contained: true
+    code-fold: true
+    df-print: paged
+    callout-appearance: simple
+    callout-icon: false
+bibliography: library.bib  
+---
+
+```{r setup, include=FALSE}
+
+# Ser knitr options
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+# Function to check and install missing packages
+check_and_install <- function(packages) {
+  for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE)) {
+      install.packages(pkg, dependencies = TRUE)
+      library(pkg, character.only = TRUE)
+    }
+  }
+}
+
+# List of packages you need
+required_packages <- c("mHMMbayes", "tidyverse", "viridis", "pbapply")
+
+# Check and install missing packages
+check_and_install(required_packages)
+
+# Set up working environment
+library(tidyverse)
+library(mHMMbayes)
+library(viridis)
+library(pbapply)
+
+```
+
+## Introduction
+
+The [`mHMMbayes`](https://cran.r-project.org/web/packages/mHMMbayes/index.html) package for R allows the user to fit "true" multilevel HMMs (i.e., with continuously distributed individual random effects in all parameters) to *categorical*, *continuous*, or *count* univariate and multivariate time series of one or more individuals at a time, of varying length, supporting list-wise observations missing at random, and with the option of including individual-level covariates in both components of the model. It also contains additional functions making possible to summarize and visualize the model outputs, obtain model selection criteria, extract the probabilistic state decoding for each individual sequence, and simulate new data. Estimation in `mHMMbayes` is done in a fully Bayesian framework using a forward-backward Metropolis within Gibbs sampler, which results not only in parameter point estimates but also returns by default a measure of the uncertainty in the estimation.
+
+Throughout my PhD I worked on several new functionalities of `mHMMbayes`, some of which are showcased on this data analysis example. For example, in the latest major update of the package I added support for count data through a Poisson emission distribution. An overview of the changes I implemented can be found on this [GitHub pull request](https://github.com/emmekeaarts/mHMMbayes/pull/30).
+
+This extension was motivated by a collaboration with neuroscientists of the University of Lyon. It led to a [joint applied publication](https://onlinelibrary.wiley.com/doi/full/10.1111/ejn.16065), and a [methodological preprint](https://arxiv.org/pdf/2403.12561) currently under review, where we present the model to a statistical audience. As part of this data analysis example we will reproduce the results in one of the two empirical applications included in the methodological paper.
+
+For more details about the statistical implementation of the model, refer to the [preprint](https://arxiv.org/pdf/2403.12561).
+
+### Motivation: electrophysiological data
+
+The goal of this empirical application of the model is to illustrate how it can be used to uncover neural states from *in vivo* electrophysiological experiments while accounting for individual differences between multiple trials. Without going into too much detail, one of the current views in neurophysiology supports the hypothesis that neural populations, rather than single neurons, may be the fundamental unit of cortical computation [@saxena_towards_2019]. Although basic HMMs have been successfully applied to these types of data to uncover neural states, analysing chronically recorded neural population activity can be challenging not only because of the high dimensionality of activity but also because of changes in the signal that may occur due to neural plasticity (e.g., task-induced plasticity, @dayan_neuroplasticity_2011) or not (e.g., electrode drift or degradation, @barrese_scanning_2016; @welle_ultra-small_2020). From a statistical modelling perspective, these changes in the recording signal cause variation over trials, which is ignored when using conventional HMM. When applying the multilevel HMM, this variation can be accommodated in the model.
+
+To show how to extract neural states while accounting for different sources of variability, we use a selection of the data previously analysed in [@kirchherr_bayesian_2022], consisting of the recordings of neural activity of two monkeys trained to reach, grasp, and place an object after receiving a sound stimulus in an experimental set up, while they perform such task. Here, the dependent variables are the number of neural activations (spike counts) per 10 millisecond bin produced while the monkeys perform the reaching task, recorded with multi-electrode probe surgically inserted in its primary motor cortex (M1) (see Figure @ref(fig:monkey_results)a for an example of a trial).
+
+For the illustrative purpose of this application we focus on the spike counts recorded with 15 electrodes in 87 experimental trials performed in the span of two days on a single macaque monkey (*Macaca mulatta sp.*) (Day 1--3, monkey 1, electrodes 1--21 in the original data; we refer the reader to @kirchherr_bayesian_2022 for further information on the collection of the data set). Here, each trial will be used as an independent individual in the model, with the spike counts over time recorded by the 21 electrodes, the dependent variables in the model, and the number of hidden states fixed to 6 (the same as in the original study). Notice that whereas the previous empirical application was used to explore the individual differences in the behaviour of a relatively small number of individuals (whales) observed in their natural environment, here, we focus on uncovering the forward probabilities of hidden states on different trials with respect to a controlled experimental stimulus.
+
+Throughouth this data analysis example, we will:
+
+1.  Train multilevel hidden Markov model wiht a Poisson-lognormal emission distribution with 6 hidden states, using the group-level parameter point estimation in @kirchherr_bayesian_2022 for the starting values and weakly informative hyper-priors.
+2.  Examine the output of the model in terms of the group-level transition and emission distributions.
+3.  Find the most likely sequence of hidden states (global decoding) for each trial, along with the state forward probabilities obtained with the Viterbi algorithm [@Viterbi1967].
+4.  Use the event onset times (not seen by the model) of four consecutive behavioral clues (go signal, arm movement, object contact, and object placing) to provide an interpretation to the hidden states uncovered, and examine their alignment with the forward probabilities.
+5.  Use posterior predictive checks (PPCs) to assess the adequacy of the model fit to the empirical data, and visualize the expected AP counts given the state decoded, and the autocorrelation of the observations.
+
+### Loading the data
+
+We can start setting up the local environment with the necessary objects and the latest version of `mHMMbayes`. We mainly need two data files:
+
+-   `data` with the actual potential activation (PA) counts.
+-   `events` with the onset times of the motor task.
+
+Since `data` is in a long format, and contains information that we will not use (experimental conditions) some preprocessing is needed before we can pass it to the model.
+
+```{r get environment ready, message=FALSE, warning=FALSE, echo = T, results = 'hide'}
+
+# Load data sets
+data <- read_csv("data/hmm_data.csv")
+events <- read_csv("data/events_monkey1.csv") %>%
+    rename("hand_mvmt_onset" = "mo", "obj_contact" = "oc", "place" = "pl")
+
+# Reshape to tidy wide format
+data_wide <- data %>%
+    spread(key = electrode, value = value)
+
+data_wide <- inner_join(data_wide, events) %>%
+    filter(date %in% 1:3,
+           condition %in% 1:3) %>%
+    group_by(trial) %>%
+    mutate(id = cur_group_id()) %>%
+    ungroup()
+
+# Use data from the first day
+train <- data_wide %>%
+    dplyr::select(id, `1`:`32`) %>%
+    as.matrix()
+
+# Add informative column names
+colnames(train) <- c("trial",paste0("el",1:21))
+
+```
+
+The first column of the data indicates the trial number, and the remaining columns are the recorded in each of the 21 electrodes. Over the rows, we find the number of action potential (AP) counts recorded on each time bin. Let's examine how the data looks like:
+
+```{r}
+
+head(train)
+
+```
+
+Electrophysiology data is often visualized in raster plots. These are tile plots with the number of AP observed per time bin over the electrodes. We can visualize a number of trials:
+
+```{r}
+
+data_wide %>%
+    filter(trial %in% sample(1:87, 15)) %>%
+    gather(electrode, value, -day, -date, -trial, -condition, -timestep, -c(go:id)) %>%
+    mutate(electrode = as.numeric(factor(electrode)),
+           timestep = timestep*10,
+           trial = factor(trial, levels = 1:87, labels = paste0("trial ",1:87))) %>%
+    ggplot(aes(x=timestep, y=electrode, fill = value)) +
+    geom_tile() +
+    facet_wrap(trial~., nrow = 5) +
+    scale_fill_gradient(low = "white", high = "black",name = "AP counts") +
+    theme_minimal(base_size = 10) +
+    scale_y_continuous(breaks = c(1,11,21)) +
+    xlab("Binned time (milliseconds)") +
+    ylab("Electrode")
+
+```
+
+## Model fitting
+
+### Finding a good set of starting values
+
+Before fitting the model we have to specify the starting values for the parameters in the Monte Carlo Makov chain (MCMC). A common way of finding starting values is fitting a single-level HMM on the aggregated data using Expectation-Maximization (EM), and using the modelling results as initial values for our multilevel Bayesian HMM. This can be done, for instance, with the R package `depmixS4`.
+
+Instead of using these starting values one could opt for specifying starting values based on the point estimated of previous runs of the model. In addition, we have to specify the hyper-priors on the group-level priors.
+
+For more information on the hyper-prior specification, check the corresponding documentation (e.g., `?prior_emiss_count`).
+
+```{r fit model, echo = T, results = 'hide'}
+
+# Load starting values:
+load("data/model_tv_plnorm_6states_1_out.rda")
+
+# Fit MHMM-PLN
+set.seed(42)
+
+# General parameters
+n       <- length(unique(train[,1]))    # Number of subjects (trials)
+m       <- 6                            # Number of hidden states
+n_dep   <- 21                           # Number of dependent variables
+n_iter  <- 500                          # Number of hidden states
+burn_in <- 250                          # Number of dependent variables
+
+
+# Specify hyper-prior for the poisson emission distribution (here, non-informative hyper priors are used)
+emiss_mu0 <- lapply(emiss_start, function(q) matrix(log(as.numeric(q)), nrow = 1))
+
+hyp_pr <- prior_emiss_count(gen = list(m = m, n_dep = n_dep),
+                            emiss_mu0 = emiss_mu0,
+                            emiss_K0  = rep(list(1),n_dep), # Theoretical number of subjects in which we base our priors: 1 puts a low weight compared to number of trials (87)
+                            emiss_nu  = rep(list(1),n_dep), # Degrees of freedom of the hyper priors: the larger the number the stronger the prior
+                            emiss_V   = rep(list(rep(0.001, m)),n_dep), # Variance of the hyper priors: the larger, the less informative
+                            log_scale = TRUE
+                            
+) # Hyper priors on the variance, the smaller the less informative
+
+```
+
+Now we can finally train the multilevel HMM calling the function `mHMM()`.
+
+```{r, eval=FALSE}
+# Fit PLN model
+out <- mHMM(s_data = train,
+            gen = list(m = m, n_dep = n_dep),
+            start_val = c(list(gamma_start), emiss_start),
+            emiss_hyp_prior = hyp_pr,
+            mcmc = list(J = n_iter, burn_in = burn_in),
+            show_progress = TRUE, data_distr = "count")
+
+saveRDS(out, "outputs/out_m6_small.rds")
+
+```
+
+Notice that to restrict the knitting time I only used 500 MCMC iterations. However, the number of iterations used should be closer to 4000 with 2000 iterations as burn-in to dissipate the effect of starting conditions. Using a lower number of iterations is risky, because the MCMC may not have converged yet.
+
+Since model training can take some time, we will load the model output obtained following the previous steps. Printing the model provides us with some useful information:
+
+```{r}
+
+out <- readRDS("outputs/out_m6_small.rds")
+
+out
+
+```
+
+We can also use the `mHMM` method `summary()`to obtain information on the group-level parameters of the estimated model:
+
+```{r, eval=FALSE}
+
+summary(out)
+
+```
+
+It's also useful to check that the Markov chains are stable over the iterations. For instance, here for the group-level transition probability means:
+
+```{r}
+
+out$gamma_prob_bar %>%
+    as.data.frame() %>%
+    mutate(iterations = row_number()) %>%
+    gather(state, probability, -iterations) %>%
+    ggplot(aes(iterations, probability)) +
+    geom_line() +
+    facet_wrap(state~.) +
+    theme_minimal()
+
+```
+
+The figure does not reveals substantial issues of lack of parameter stability of the MCMC iterations. However, doing a proper convergence check would imply running a second chain using a different set of starting values. Then visual and analytical (e.g., PSRF) convergence checks can be done.
+
+## Results
+
+### Group-level transition and emission means
+
+The switching dynamics between states are governed by the group-level transition probability matrix (see Figure below). The off-diagonal transitions reflect the consecutive nature of the states, with the highest off-diagonal probability of moving from one state to the immediate consecutive (e.g., $S1 \rightarrow S2$, $S2 \rightarrow S3$, and so on) with the notable exception of State 6, which is more likely to switch to State 1. Notice that, although such transition probability matrix suggests a left-to-right process, backward transitions between states are still allowed (and in fact are more likely than transitions between other states). The high self-transition probabilities obtained for the six states go in line with states that are persistent over time.
+
+```{r monkey_group_gamma, fig.cap="Group-level transition probability matrix", fig.dim = c(5, 4.8)}
+
+# Transition plot
+p_gamma <- out$gamma_prob_bar %>%
+    as.data.frame() %>%
+    mutate(iter = row_number()) %>%
+    gather(state, value, -iter) %>%
+    filter(iter > burn_in) %>%
+    group_by(state) %>%
+    summarise(median_value = median(value)) %>%
+    separate(state, into = c("from","to"), sep = "to") %>%
+    mutate(from = factor(from, levels = paste0("S",c(2,4,3,6,5,1)), labels = paste0("S",m:1)),
+           to = factor(to, levels = paste0("S",c(1,5,6,3,4,2)), labels = paste0("S",1:m))) %>%
+    mutate(self = ifelse(from == to, TRUE, FALSE)) %>%
+    ggplot(aes(x = to, y = from, fill = median_value )) +
+    geom_tile() +
+    geom_text(aes(label = case_when(median_value >= 0.001 ~ format(round(median_value, digits = 3), nsmall = 2),
+                                    median_value < 0.001 ~ "<0.001"), color = self), size = 3) +
+    scale_fill_viridis_c(option = "magma",
+                         limits = c(0,1),
+                         breaks = seq(0,1,0.1),
+                         labels = seq(0,1,0.1),
+                         trans = scales::sqrt_trans()) +
+    scale_color_manual(values = c("white", "black"), guide = NULL) +
+    theme_minimal() +
+    theme(legend.position = "right") +
+    xlab("To neural state") +
+    ylab("From neural state") +
+    theme(axis.text.x = element_text(angle = 0, hjust=0),
+          axis.text.y = element_text(angle = 0)) +
+    labs(fill = "") +
+    theme(legend.key.height= unit(2, 'cm'),
+          legend.key.width= unit(0.3, 'cm'))
+
+p_gamma
+
+```
+
+We can also visualize the group-level emission distribution, with the information of the expected AP counts per electrode given the state visited:
+
+```{r monkey_group_emiss, fig.dim = c(4, 6)}
+
+## Group-level emissions
+emiss_group <- do.call(rbind, lapply(1:length(out$emiss_mu_bar), function(q){
+    out$emiss_mu_bar[[q]] %>%
+        as.data.frame() %>%
+        mutate(n_dep = names(out$emiss_mu_bar[q])) %>%
+        slice(out$input$burn_in : out$input$J) %>%
+        apply(., 2, median)
+})) %>%
+    as.data.frame()
+
+p_emiss <- emiss_group %>%
+    gather(state, value, -n_dep) %>%
+    mutate(value = exp(as.numeric(value))) %>%
+    rename("dep"="n_dep") %>%
+    mutate(dep = factor(dep, levels = paste0("el",1:n_dep), labels = 1:n_dep),
+           state = factor(state, levels = paste0("mu_",c(1,5,6,3,4,2)), labels = paste0("S",1:m))) %>%
+    ggplot(aes(x=state, y=dep, fill=value)) +
+    geom_tile() +
+    geom_text(aes(label = format(round(value, digits = 2), nsmall = 2), color = value^10), size = 3) +
+    scale_color_gradient(low = "white", high = "black", guide = NULL) +
+    scale_fill_viridis_c(option = "magma") +
+    theme_minimal() +
+    xlab("Neural state") +
+    ylab("Electrode") +
+    labs(fill = "") +
+    theme(legend.key.height= unit(3, 'cm'),
+          legend.key.width= unit(0.3, 'cm'))
+
+p_emiss
+
+```
+
+Interestingly, State 1 and state 6 exhibit a similar pattern of electric activity over the electrodes, although the expected emission counts are higher in State 6.
+
+### Between trial variability
+
+We can also examine the betwen-trial variability in the emission distribution means, in the form of a histogram by electrode and state:
+
+```{r monkey_trial_emiss, fig.dim = c(4, 6)}
+
+## Subject specific
+subj_data <- do.call(rbind, lapply(1:length(out$PD_subj), function(s) out$PD_subj[[s]]$count_emiss %>%
+                                       as.data.frame() %>%
+                                       mutate(subj = s,
+                                              iteration = row_number()) %>%
+                                       slice(burn_in:n_iter) %>%
+                                       apply(., 2, median)))
+
+trial_emiss <- subj_data %>%
+    as.data.frame() %>%
+    mutate(subj = factor(subj)) %>%
+    gather(parameter, value, -iteration, -subj) %>%
+    filter(str_detect(parameter, "_mu")) %>%
+    separate(col = parameter, into = c("dep","state"), sep = "_") %>%
+    mutate(dep = factor(dep, levels = paste0("dep",1:n_dep), labels = paste0("Electrode ",1:n_dep)),
+           state = factor(state, levels = paste0("S",c(1,5,6,3,4,2)), labels = paste0("S",1:m))) %>%
+    ggplot(aes(value, group = interaction(subj, state), fill = state)) +
+    geom_histogram(alpha = 0.7, bins = 50) +
+    scale_fill_viridis_d(option='viridis') +
+    facet_grid(dep~., scales = "free_y") +
+    theme_minimal(base_size = 8) +
+    labs(ylab = "Emission value") +
+    theme(strip.text.y = element_text(angle=0))
+
+trial_emiss
+
+```
+
+The substantial between-trial variability warrants the adoption of a multilevel approach, as visualized in here.
+
+### Forward probabilities
+
+So far we have discovered a structure in the dynamics of switching between states, but we do not understand what these states represent. To assign a meaning to the states we will explore their likelihood as the motor task unfolds over time: we will look at the *forward probabilities* of the states.
+
+Using the obtained (subject specific) parameter estimates and the complete sequence of observations for each subject, we can infer the most likely sequence of states for each subject. To obtain the probability of each state at each point in time (where the sequence of states with the highest probability forms the sequence of most likely states), we make use of the Viterbi algorithm (Viterbi, 1967). In the package `mHMMbayes`, (an extended version of) the Viterbi algorithm is implemented in the function `vit_mHMM()`. The required input is the object that contains the fitted model generated by the function `mHMM()`, and the data used as input when fitting the multilevel hidden Markov model.
+
+```{r}
+
+# Forward probabilities
+decoding <- vit_mHMM(out, train, return_state_prob = TRUE)
+
+forward_probs <- decoding %>%
+    rename("id" = "subj") %>%
+    group_by(id) %>%
+    mutate(timestep = row_number()) %>%
+    ungroup() %>%
+    dplyr::select(-state) %>%
+    gather(state, value, -c(id, timestep)) %>%
+    mutate(state = factor(state, levels = paste0("pr_state_",1:m), labels = paste0("S",1:m)))
+
+head(forward_probs)
+
+```
+
+The six hidden states uncovered with the MHMM generally show a good temporal alignment with different stages of the reaching task performed by the monkey, as exemplified in the figure below for the trial number 36. In panel (a), consisting of a raster plot, we see the electric activity of a trial, and in panel (b) the estimated forward probabilities for the same trial with the overlaying movement onset times. Transitions between states appear to occur in the neighborhood of a movement onset.
+
+Notice that hidden states in this context represent groups of neurons whose electrical activity changes synchronically during a period of time, conforming what is known as a transient neural state, which may be involved in the orchestration of a motor task.
+
+```{r}
+
+# Pick a trial as example
+case <- 36
+
+p_top_top <- data_wide %>%
+    filter(trial == case) %>%
+    # gather(electrode, value, -date, -trial, -condition, -timestep, -go, -hand_mvmt_onset, -obj_contact, -place, -id) %>%
+    gather(electrode, value, -day, -date, -trial, -condition, -timestep, -c(go:id)) %>%
+    mutate(electrode = as.numeric(factor(electrode)),
+           timestep = timestep*10) %>%
+    ggplot(aes(x=timestep, y=electrode, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "black") +
+    theme_minimal(base_size = 10) +
+    scale_x_continuous(breaks = NULL) +
+    scale_y_continuous(breaks = c(1,11,21)) +
+    theme(legend.position = "none") +
+    xlab(element_blank()) +
+    ylab("Electrode")
+
+p_top_bottom <- ggplot() +
+    geom_line(data= left_join(forward_probs %>%
+                                  mutate(id = as.integer(stringr::str_remove(id, "subj_")),
+                                         timestep = timestep*10,
+                                         state = factor(state, level = paste0("S",c(1,5,6,3,4,2)), labels = paste0("S",1:m))),
+                              data_wide %>%
+                                  dplyr::select(id, go:place) %>%
+                                  # dplyr::select(id, go:pl) %>%
+                                  distinct(id, .keep_all = TRUE)) %>%
+                  gather(movement, onset, -id, -state, -timestep, -value) %>%
+                  group_by(movement, id) %>%
+                  mutate(event_onset = timestep - onset) %>%
+                  filter(id == case),
+              aes(x = timestep, y = value, color = state),
+              size = 1, alpha = 0.7) +
+    scale_colour_viridis_d(option="viridis") +
+    geom_line(data = data.frame(x = data_wide %>%
+                                    dplyr::select(id, go:place) %>%
+                                    # dplyr::select(id, go:pl) %>%
+                                    distinct(id, .keep_all = TRUE) %>%
+                                    slice(case) %>%
+                                    dplyr::select(-id) %>%
+                                    as.numeric() %>%
+                                    rep(each=2),
+                                y = c(0,1.05),
+                                movement = rep(1:4, each=2)),
+              aes(x=x, y=y, group = movement),
+              linetype = "dashed") +
+    annotate(geom = "text", y = 1.1, x = data_wide %>%
+                 dplyr::select(id, go:place) %>%
+                 # dplyr::select(id, go:pl) %>%
+                 distinct(id, .keep_all = TRUE) %>%
+                 slice(case) %>%
+                 dplyr::select(-id) %>%
+                 as.numeric(), label = c("Go", "Movement", "Contact", "Place")) +
+    theme_minimal(base_size = 10) +
+    coord_cartesian(ylim = c(0,1.1)) +
+    scale_y_continuous(breaks = c(0,0.5,1)) +
+    theme(legend.position = "none") +
+    ylab("State prob.") +
+    xlab("Time (ms)")
+
+# Combine plots
+p_top <- cowplot::plot_grid(p_top_top, p_top_bottom, labels = c("a","b"), label_size = 12, rel_heights = c(0.8, 1), align = "v", ncol = 1)
+
+p_top
+
+```
+
+### Overall patterns in the forward probabilties
+
+To evaluate whether the apparent alignment between state switches and specific segments of movement onset seen for a specific trial occurs is consistent in the full data we can look at the averaged state forward probabilities across trials (see Figure (c) below). Since each trial has a different start time, we have to align them to the onset of each motor task (go signal, movement, object contact, and placing). Another way of visualizing the alignment is to look at the state decoding (the most likely sequence of states for each trial) stacked over trials as shown in Figure (d).
+
+```{r}
+
+# Average by movement
+p_bottom_left <- left_join(forward_probs %>%
+                               mutate(id = as.integer(stringr::str_remove(id, "subj_")),
+                                      timestep = timestep*10,
+                                      state = factor(state, level = paste0("S",c(1,5,6,3,4,2)), labels = paste0("S",1:m))),
+                           data_wide %>%
+                               dplyr::select(id, go:place) %>%
+                               distinct(id, .keep_all = TRUE)) %>%
+    gather(movement, onset, -id, -state, -timestep, -value) %>%
+    group_by(movement, id) %>%
+    mutate(onset = round(onset,-1),
+           event_onset = timestep - onset) %>%
+    filter(event_onset >= -150 & event_onset <= 150) %>%
+    group_by(movement, event_onset, state) %>%
+    summarise(mean_value = mean(value),
+              sd_value = sd(value),
+              lwr_ci = quantile(value, 0.025),
+              upr_ci = quantile(value, 0.975)) %>%
+    mutate(movement = factor(movement,
+                             levels = c("go","hand_mvmt_onset","obj_contact","place"),
+                             labels = c("Go", "Movement", "Contact", "Place"))) %>%
+    ggplot(aes(x=event_onset, y=mean_value, color=state)) +
+    geom_line(alpha = 0.6, size = 1) +
+    geom_ribbon(aes(ymin = mean_value-sd_value, ymax = mean_value+sd_value, group = state), alpha = 0.05, colour = NA) +
+    geom_vline(xintercept = 0, linetype="dashed") +
+    facet_wrap(.~movement, ncol = 1) +
+    scale_colour_viridis_d(option="viridis") +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    coord_cartesian(ylim = c(0,1)) +
+    ylab("State prob.") +
+    xlab("Onset time (ms)")
+
+# State decoding
+decoding <- vit_mHMM(out, train, return_state_prob = TRUE)
+
+decoding <- decoding %>%
+    as.data.frame() %>%
+    rename("id" = "subj") %>%
+    select(id, state) %>%
+    group_by(id) %>%
+    mutate(timestep = row_number()) %>%
+    ungroup()
+
+# By movement onset
+p_bottom_right <- left_join(decoding %>%
+                                mutate(id = as.integer(stringr::str_remove(id, "subj_")),
+                                       timestep = timestep*10,
+                                       state = factor(state, level = c(1,5,6,3,4,2), labels = 1:m)),
+                            data_wide %>%
+                                dplyr::select(id, go:place) %>%
+                                distinct(id, .keep_all = TRUE)) %>%
+    gather(movement, onset, -id, -state, -timestep) %>%
+    group_by(movement, id) %>%
+    arrange(onset) %>%
+    ungroup() %>%
+    group_split(movement) %>%
+    lapply(., function(s) s %>%
+               group_by(onset, id) %>%
+               mutate(rank = cur_group_id())) %>%
+    bind_rows() %>%
+    mutate(movement = factor(movement,
+                             levels = c("go","hand_mvmt_onset","obj_contact","place"),
+                             labels = c("Go", "Movement", "Contact", "Place"))) %>%
+    ggplot() +
+    geom_tile(aes(x = timestep,
+                  y=rank,
+                  fill = state)) +
+    geom_point(aes(x = onset,
+                   y = rank), shape = 1, color="red", fill=NA, size = 0.1, alpha=0.5) +
+    scale_fill_viridis_d(option='viridis') +
+    facet_wrap(movement~., ncol=1, scales='free_y') +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    ylab("Ranked trials") +
+    xlab("Time (ms)")
+
+legend <- left_join(forward_probs %>%
+                        mutate(id = as.integer(stringr::str_remove(id, "subj_")),
+                               timestep = timestep*10,
+                               state = factor(state, level = paste0("S",c(1,5,6,3,4,2)), labels = 1:m)),
+                    data_wide %>%
+                        dplyr::select(id, go:place) %>%
+                        distinct(id, .keep_all = TRUE)) %>%
+    gather(movement, onset, -id, -state, -timestep, -value) %>%
+    group_by(movement, id) %>%
+    mutate(onset = round(onset,-1),
+           event_onset = timestep - onset) %>%
+    filter(event_onset >= -150 & event_onset <= 150) %>%
+    group_by(movement, event_onset, state) %>%
+    summarise(mean_value = mean(value),
+              sd_value = sd(value),
+              lwr_ci = quantile(value, 0.025),
+              upr_ci = quantile(value, 0.975)) %>%
+    ggplot(aes(x=event_onset, y=mean_value, color=state)) +
+    geom_line(alpha = 0.6, size = 1) +
+    geom_ribbon(aes(ymin = mean_value-sd_value, ymax = mean_value+sd_value, group = state), alpha = 0.05, colour = NA) +
+    geom_vline(xintercept = 0, linetype="dashed") +
+    facet_wrap(.~movement, ncol = 1) +
+    scale_colour_viridis_d(option="viridis") +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    ylab("State prob.") +
+    xlab("Onset time (ms)") +
+    labs(color="State")
+
+legend <- cowplot::get_legend(legend)
+
+# Combine plots
+p_bottom <- cowplot::plot_grid(p_bottom_left, p_bottom_right, labels = c("c","d",""), label_size = 12, rel_widths = c(1, 1), align = "hv", ncol = 2)
+p_bottom <- cowplot::plot_grid(p_bottom, legend, rel_heights = c(1, 0.1), ncol = 1)
+
+p_bottom
+
+```
+
+We can define the following steps from the figures:
+
+-   The first neural state (State 1) appears to represent a basal state of general uniform activity in the neurons recorded with the 21 electrodes in the example (see Figure (c), Go panel).
+
+-   The forward probability of the second neural state (State 2) becomes the most likely at about 200 ms prior to the hand movement onset (at which the monkey starts to reach for the object) and peaks at 100 ms, after which it recedes, giving place to the third neural state (State 3) (Figure (c), Movement panel).
+
+-   The onset of the hand movement coincides with the switching between States 2 and 3, with the later peaking at about 75 ms after the movement onset (Figure (c), Movement panel).
+
+-   The fourth neural state (State 4) precedes the object contact, peaking approximately 75 ms before it (Figure (c), Contact panel).
+
+-   The onset of the object contact marks the switching between States 4 and 5, with the later exhibiting a peak at about 50 ms after the object contact onset (Figure (c), Contact panel).
+
+-   Approximately 150 ms before the object placing, State 6 becomes the most likely state, and it remains that way until the end of the trials (Figure (c), Place panel).
+
+-   Finally, the temporal neighborhood of the object placing appears to be accompanied by an increase in the likelihood of the first neural state (State 1) in at least some of the trials (Figure (c), Place panel), recapitulating a basal activity over the 21 electrodes (e.g., see Figure (a) ).
+
+The temporal alignment between the average forward probabilities across and the behavioral landmarks was observed in most of the trials, as depicted in the global state decoding for the 87 trials in the data ordered by the corresponding landmark onset in Figure (d).
+
+## Assessing model fit:
+
+To conclude, we demonstrate the process of assessing model fit through posterior predictive checks (PPCs). The idea is to check whether the patterns and characteristics seen in the observed data are also present in the simulated data. This is done simulating a large number of new synthetic data sets from the fitted model, to obtain a posterior predictive distribution. Then, the synthetic data is compared to the observed data at the individual or group level for a number of statistics (e.g., mean counts, proportion of zero counts, etc).
+
+First, we need to put together all the elements necessary to generate new data from our MHMM: the group-level transition and emission means (i.e., fixed effects),
+
+```{r, eval=FALSE}
+
+# Set the working parameters to the correct values:
+m <- out$input$m
+n_dep <- out$input$n_dep
+burn_in <- out$input$burn_in
+n_iter <- out$input$J
+
+## Fixed effects:
+# Transitions
+gamma_ppc <- out$gamma_int_bar %>%
+    as.data.frame() %>%
+    mutate(iter = row_number()) %>%
+    filter(iter > burn_in) %>%
+    dplyr::select(-iter) %>%
+    summarise(across(.cols = everything(), median)) %>%
+    as.numeric() %>%
+    matrix(., nrow = m, byrow = TRUE) %>%
+    int_to_prob()
+
+gamma_ppc[1,1] <- gamma_ppc[1,1] + 1-apply(gamma_ppc, 1, sum)[1]
+gamma_ppc[2,2] <- gamma_ppc[2,2] + 1-apply(gamma_ppc, 1, sum)[2]
+gamma_ppc[3,3] <- gamma_ppc[3,3] + 1-apply(gamma_ppc, 1, sum)[3]
+gamma_ppc[4,4] <- gamma_ppc[4,4] + 1-apply(gamma_ppc, 1, sum)[4]
+gamma_ppc[5,5] <- gamma_ppc[5,5] + 1-apply(gamma_ppc, 1, sum)[5]
+gamma_ppc[6,6] <- gamma_ppc[6,6] + 1-apply(gamma_ppc, 1, sum)[6]
+
+# Emissions
+emiss_ppc <- lapply(1:length(out$emiss_mu_bar), function(s) {
+
+    emiss <- out$emiss_mu_bar[[s]] %>%
+        as.data.frame() %>%
+        mutate(iter = row_number()) %>%
+        filter(iter > burn_in) %>%
+        dplyr::select(-iter) %>%
+        summarise(across(.cols = everything(), median)) %>%
+        gather(mu, value) %>%
+        pull(value) %>%
+        matrix(., nrow = m)
+
+    emiss
+
+})
+
+```
+
+and the between-individual variance components of the transition and emission distribution (i.e., the random effects):
+
+```{r, eval=FALSE}
+## Random effect: between subject variance
+
+# Transitions
+gamma_var_ppc <- apply(out$gamma_V_int_bar[(burn_in+1):n_iter,] %>%
+                           as.data.frame(),
+                       2, median) %>%
+    as.numeric()
+gamma_var_ppc <- matrix(gamma_var_ppc, nrow = m, ncol = m-1, byrow = TRUE)
+
+# Emissions
+emiss_varmu_ppc <- lapply(out$emiss_varmu_bar, function(emiss) {
+    emiss %>%
+        as.data.frame() %>%
+        mutate(iter = row_number()) %>%
+        filter(iter > burn_in) %>%
+        dplyr::select(-iter) %>%
+        summarise(across(.cols = everything(), median)) %>%
+        gather(mu, value) %>%
+        dplyr::select(value) %>%
+        as.matrix()
+})
+
+n_t <- round(mean(table(data_wide$trial)),0)
+n <- length(unique(data_wide$trial))
+
+```
+
+With these four elements in place (`gamma_ppc`, `emiss_ppc`, `gamma_var_ppc`, and `emiss_varmu_ppc`) we are now ready to generate synthetic data sets (in this case, 200 repetitions):
+
+```{r, eval=FALSE}
+
+# Simulate data
+set.seed(42)
+ppc_data <- pbapply::pblapply(1:200, function(s) mHMMbayes::sim_mHMM(n_t = n_t, n = n,
+                                                                     gen = list(m = m, n_dep = n_dep),
+                                                                     data_distr = "count",
+                                                                     gamma = gamma_ppc,
+                                                                     emiss_distr = emiss_ppc,
+                                                                     var_gamma = gamma_var_ppc,
+                                                                     var_emiss = emiss_varmu_ppc,
+                                                                     return_ind_par = FALSE,
+                                                                     start_state = 1))
+
+
+# Save output
+saveRDS(ppc_data, "outputs/ppc_monkey1_multilevel_small.rds")
+
+```
+
+From the synthetic data sets we will extract any statistics we care about. In this example, we will use:
+
+-   the mean AP counts
+-   the standard deviation
+-   the maximum value observed
+-   the proportion of zeros
+
+to assess the goodness of fit our model to the empirical data. If the model offers good fit, then the distribution of these statistics over the synthetic data sets should not deviate too much from the actual value of the statistic on the empirical data.
+
+```{r}
+
+ppc_data <- readRDS("outputs/ppc_monkey1_multilevel_small.rds")
+
+# Means
+ppc1 <- cbind("model" = "multilevel", do.call(bind_rows, lapply(ppc_data, function(s) colMeans(s$obs))))
+
+# SD
+ppc2 <- cbind("model" = "multilevel", do.call(bind_rows, lapply(ppc_data, function(s) apply(s$obs,2,sd))))
+
+# Proportions of zeros
+ppc3 <- cbind("model" = "multilevel", do.call(bind_rows, lapply(ppc_data, function(s) apply(s$obs,2,function(s) mean(s==0)))))
+
+# Max value
+ppc4 <- cbind("model" = "multilevel", do.call(bind_rows, lapply(ppc_data, function(s) apply(s$obs,2,max))))
+
+```
+
+We also calculate the same statistics on the empirical data:
+
+```{r}
+# True values
+true_means <- train %>%
+    as.data.frame() %>%
+    colMeans() %>%
+    matrix(., nrow = 1) %>%
+    as.data.frame()
+names(true_means) <- c("subj",paste0("el",1:n_dep))
+true_means <- true_means %>%
+    gather(dep, value, -subj)
+
+true_medians <- train %>%
+    as.data.frame() %>%
+    apply(., 2, median) %>%
+    matrix(., nrow = 1) %>%
+    as.data.frame()
+names(true_medians) <- c("subj",paste0("el",1:n_dep))
+true_medians <- true_medians %>%
+    gather(dep, value, -subj)
+
+true_sd <- train %>%
+    as.data.frame() %>%
+    apply(., 2, sd) %>%
+    matrix(., nrow = 1) %>%
+    as.data.frame()
+names(true_sd) <- c("subj",paste0("el",1:n_dep))
+true_sd <- true_sd %>%
+    gather(dep, value, -subj)
+
+true_zeros <- train %>%
+    as.data.frame() %>%
+    apply(., 2, function(s) mean(s==0)) %>%
+    matrix(., nrow = 1) %>%
+    as.data.frame()
+names(true_zeros) <- c("subj",paste0("el",1:n_dep))
+true_zeros <- true_zeros %>%
+    gather(dep, value, -subj)
+
+true_max <- train %>%
+    as.data.frame() %>%
+    apply(., 2, max) %>%
+    matrix(., nrow = 1) %>%
+    as.data.frame()
+names(true_max) <- c("subj",paste0("el",1:n_dep))
+true_max <- true_max %>%
+    gather(dep, value, -subj)
+
+```
+
+We perform some data structuring for easier handling with `ggplot2`, and visualize them in a combined plot over states and electrodes.
+
+```{r fig:monkey_ppc, fig.dim = c(5, 8)}
+
+# PPCs
+names(ppc1) <- c("model","subj",paste0("el",1:n_dep))
+names(ppc2) <- c("model","subj",paste0("el",1:n_dep))
+names(ppc3) <- c("model","subj",paste0("el",1:n_dep))
+names(ppc4) <- c("model","subj",paste0("el",1:n_dep))
+
+# Together
+ppc_statistics <- bind_rows(cbind("ppc" = "ppc1", ppc1),
+                            cbind("ppc" = "ppc2", ppc2),
+                            cbind("ppc" = "ppc3", ppc3),
+                            cbind("ppc" = "ppc4", ppc4)) %>%
+    select(-subj) %>%
+    gather(dep, value, -ppc, -model) %>%
+    mutate(dep = factor(dep, levels = paste0("el",1:n_dep), labels = paste0("Electrode ",1:n_dep)),
+           ppc = case_when(ppc == "ppc1" ~ "T = mean(y)",
+                           ppc == "ppc2" ~ "T = sd(y)",
+                           ppc == "ppc3" ~ "T = prop(y=zero)",
+                           ppc == "ppc4" ~ "T = max(y)"),
+           ppc = factor(ppc, levels = c("T = mean(y)","T = sd(y)","T = max(y)","T = prop(y=zero)")),
+           model = case_when(model == "onelevel" ~ "basic HMM",
+                             model == "multilevel" ~ "multilevel HMM"))
+
+true_statistics <- bind_rows(cbind("ppc" = "ppc1", true_means),
+                             cbind("ppc" = "ppc2", true_sd),
+                             cbind("ppc" = "ppc3", true_zeros),
+                             cbind("ppc" = "ppc4", true_max)) %>%
+    select(-subj) %>%
+    mutate(dep = factor(dep, levels = paste0("el",1:n_dep), labels = paste0("Electrode ",1:n_dep)),
+           ppc = case_when(ppc == "ppc1" ~ "T = mean(y)",
+                           ppc == "ppc2" ~ "T = sd(y)",
+                           ppc == "ppc3" ~ "T = prop(y=zero)",
+                           ppc == "ppc4" ~ "T = max(y)"),
+           ppc = factor(ppc, levels = c("T = mean(y)","T = sd(y)","T = max(y)","T = prop(y=zero)")))
+
+
+# Plot PPCs
+p <- ggplot(data = ppc_statistics %>%
+                drop_na(value), aes(x = value)) +
+    geom_histogram(fill = "grey",color="darkgrey",alpha=0.8) +
+    geom_vline(data = true_statistics,
+               aes(xintercept = value),
+               linetype="dashed", colour = "black") +
+    facet_grid(dep~ppc, scales = "free") +
+    theme_minimal() +
+    theme(strip.background =element_rect(fill="white")) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank()) +
+    theme(strip.text.y = element_text(angle=0)) +
+    theme(legend.position="bottom") +
+    xlab("Summary statistic value") +
+    ylab("Count") +
+    scale_y_continuous(breaks = NULL
+    )
+
+p
+
+```
+
+The posterior predictive checks did not show substantial deviations from goodness of fit, as the model was able to reproduce the values of the summary statistics taken on the aggregated empirical data for most of the electrodes. Extreme posterior predictive values were only obtained for electrode 2 (underestimation of maximum spike counts), and electrodes 17 and 18 (underestimation of the variability and the proportion of zeros).
+
+### Further model checking
+
+Finally, we can visualize the expected counts according got the most likely state on each time-step vs the actual counts observed in the data. This is the first step toward obtaining pseudo-residuals (out of the scope of this data analysis example). Here, the results for the first trial in the data set:
+
+```{r}
+
+# Extract patients' emission means (MAPs)
+subj_emiss_mu <- subj_data %>%
+    as.data.frame() %>%
+    gather(parameter, mu, -iteration, -subj) %>%
+    filter(str_detect(parameter, "_mu")) %>%
+    separate(col = parameter, into = c("dep","state"), sep = "_") %>%
+    mutate(dep = factor(dep, levels = paste0("dep",1:n_dep), labels = paste0("Electrode ",1:n_dep)),
+           state = factor(state, levels = paste0("S",c(1,5,6,3,4,2)), labels = paste0("S",1:m))) %>%
+    rename("trial" = "subj")
+
+data_long <- train %>%
+    as.data.frame() %>%
+    group_by(trial) %>%
+    mutate(timestep = row_number()) %>%
+    gather(dep, obs, -c(trial, timestep)) %>%
+    mutate(dep = factor(dep, levels = paste0("el",1:n_dep), labels = paste0("Electrode ",1:n_dep)))
+
+data_labelled_long <- inner_join(data_long, decoding %>%
+                                     rename("trial" = "id")) %>%
+    mutate(state = factor(state, levels = c(1,5,6,3,4,2), labels = paste0("S",1:m)))
+
+# Select a trial
+id <- 1
+
+# Observations with emission means and SD overlayed
+print(left_join(data_labelled_long, subj_emiss_mu) %>%
+          filter(trial == id) %>%
+          ggplot() +
+          geom_line(aes(x = timestep, y = obs), alpha = 0.5) +
+          geom_line(aes(x = timestep, y = mu), color = "red", alpha = 0.5) +
+          geom_line(aes(x = timestep, y = mu - sqrt(mu)), color = "red", alpha = 0.2) +
+          geom_line(aes(x = timestep, y = mu + sqrt(mu)), color = "red", alpha = 0.2) +
+          facet_wrap(dep~., ncol = 7) +
+          theme_minimal() +
+          ggtitle(paste0("Trial ",id)))
+
+```
+
+We can also take a look at the autocorrelation function:
+
+```{r}
+
+# ACF plot
+items <- unique(subj_emiss_mu$dep)
+par(mfrow = c(2,3))
+for(item in items){
+    acf(left_join(data_labelled_long, subj_emiss_mu) %>%
+            # mutate(pseud_resid = qnorm(pnorm(value, mu, fixvar))) %>%
+            mutate(pseud_resid = qpois(ppois(obs, mu), mu)) %>%
+            drop_na() %>%
+            filter(trial == id, dep == item) %>%
+            pull(pseud_resid), main = as.character(item))
+}
+
+```
+
+Although the model generally appears to reduce the autocorrelation in the observations, for some of the electrodes the ACF score is still a bit larger than ideal. This may warrant the inclusion of an autocorrelation component in the emission distribution, that a larger number of hidden states should be assumed, or that some other underlying process is in place (for example, warranting the inclusion of time-varying covariates).
+
+## Conclusion
+
+As illustrated with the empirical example, one of the primary benefits of using the MHMM is its capability to estimate distinct parameters to each unit in the data sets. This proves especially advantageous for researchers who aim to investigate individual variations, focus on personality traits, individual dynamics, and related aspects. While some of these differences can be partially explored using individual covariates, certain traits contributing to inter-individual disparities may remain unobservable directly or lack a suitable means of measurement. In other instances, the incorporation of individual-specific random effects may merely serve a practical purpose. That was the case in the current empirical application: the inclusion of random effects was done with the purpose of enhancing the model's decoding accuracy and making estimation possible over a complex data set by controlling for the unexplained heterogeneity between trials due to an experimental set up. This doesn't necessarily imply a special interest in studying the individual properties of the trials, but rather underscores the importance of considering this nuance to prevent any detrimental effects on the results of the analyses.
+
+Although we did model checking up to some extent with the PPCs, we did not explore model selection (i.e., we stuck to a predefined model with 6 states). However, when analyzing a new data set we could explore the number of states to be used taking into account the information criteria (AIC, BIC), pseudo-residuals, PPCs, and theory.
+
+## References
